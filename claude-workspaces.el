@@ -85,6 +85,13 @@ Each element is a string like \"owner/repo\"."
   :type 'boolean
   :group 'claude-workspaces)
 
+(defcustom claude-workspaces-state-file
+  (expand-file-name "claude-workspaces-state.json"
+                    (expand-file-name ".claude" (getenv "HOME")))
+  "File to persist workspace state across Emacs restarts."
+  :type 'file
+  :group 'claude-workspaces)
+
 ;;; Internal state
 
 (defvar claude-workspaces--active nil
@@ -101,6 +108,18 @@ Each plist has keys:
   :worktree-path - path to worktree directory (if worktree)
   :github-ref  - issue/PR reference string
   :last-modified - float-time of last buffer change detected")
+
+(defvar claude-workspaces--saved nil
+  "List of saved workspace plists from previous sessions.
+Each plist has keys:
+  :name        - human-readable label
+  :project-dir - working directory
+  :branch      - git branch name
+  :worktree-p  - non-nil if this is a worktree
+  :worktree-path - path to worktree directory (if worktree)
+  :github-ref  - issue/PR reference string
+  :status      - always :saved for these entries
+  :last-modified - float-time of last activity")
 
 (defvar claude-workspaces--status-timer nil
   "Timer for polling agent status.")
@@ -126,15 +145,33 @@ Each plist has keys:
               claude-workspaces--active))
 
 (defun claude-workspaces--register (workspace)
-  "Add WORKSPACE plist to the active list."
-  (push workspace claude-workspaces--active))
+  "Add WORKSPACE plist to the active list and persist state."
+  (push workspace claude-workspaces--active)
+  ;; Remove from saved if it was there (being resumed)
+  (let ((name (plist-get workspace :name)))
+    (setq claude-workspaces--saved
+          (cl-remove-if (lambda (ws) (string= (plist-get ws :name) name))
+                        claude-workspaces--saved)))
+  (claude-workspaces--save-state))
 
 (defun claude-workspaces--unregister (workspace)
-  "Remove WORKSPACE plist from the active list."
+  "Remove WORKSPACE from active list and move to saved list for later resumption."
   (setq claude-workspaces--active
         (cl-remove-if (lambda (ws) (string= (plist-get ws :name)
                                              (plist-get workspace :name)))
-                      claude-workspaces--active)))
+                      claude-workspaces--active))
+  ;; Save to resumable list
+  (let ((saved-ws (list :name (plist-get workspace :name)
+                        :project-dir (plist-get workspace :project-dir)
+                        :branch (plist-get workspace :branch)
+                        :worktree-p (plist-get workspace :worktree-p)
+                        :worktree-path (plist-get workspace :worktree-path)
+                        :github-ref (plist-get workspace :github-ref)
+                        :status :saved
+                        :last-modified (or (plist-get workspace :last-modified)
+                                           (float-time)))))
+    (push saved-ws claude-workspaces--saved))
+  (claude-workspaces--save-state))
 
 (defun claude-workspaces--unique-name (base)
   "Return BASE if no workspace has that name, otherwise append a number."
@@ -144,6 +181,73 @@ Each plist has keys:
       (while (claude-workspaces--find-by-name (format "%s-%d" base n))
         (cl-incf n))
       (format "%s-%d" base n))))
+
+;;; State persistence
+
+(defun claude-workspaces--workspace-to-alist (ws)
+  "Convert workspace plist WS to an alist suitable for JSON serialization."
+  (let ((fields '(:name :project-dir :branch :worktree-p :worktree-path
+                        :github-ref :status :last-modified)))
+    (cl-loop for key in fields
+             for val = (plist-get ws key)
+             when val
+             collect (cons (substring (symbol-name key) 1)
+                           (if (keywordp val) (substring (symbol-name val) 1) val)))))
+
+(defun claude-workspaces--alist-to-workspace (alist)
+  "Convert an alist from JSON back to a workspace plist."
+  (list :name (alist-get 'name alist)
+        :project-dir (alist-get 'project-dir alist)
+        :branch (alist-get 'branch alist)
+        :worktree-p (eq (alist-get 'worktree-p alist) t)
+        :worktree-path (alist-get 'worktree-path alist)
+        :github-ref (alist-get 'github-ref alist)
+        :status :saved
+        :last-modified (or (alist-get 'last-modified alist) 0.0)))
+
+(defun claude-workspaces--save-state ()
+  "Persist active and saved workspaces to `claude-workspaces-state-file'."
+  (let* ((all (append
+               (mapcar #'claude-workspaces--workspace-to-alist
+                       claude-workspaces--active)
+               (mapcar #'claude-workspaces--workspace-to-alist
+                       claude-workspaces--saved)))
+         ;; Deduplicate by name, preferring earlier (active over saved)
+         (seen (make-hash-table :test 'equal))
+         (deduped (cl-loop for entry in all
+                           for name = (alist-get 'name entry)
+                           unless (gethash name seen)
+                           collect (progn (puthash name t seen) entry)))
+         (json-encoding-pretty-print t))
+    (make-directory (file-name-directory claude-workspaces-state-file) t)
+    (with-temp-file claude-workspaces-state-file
+      (insert (json-encode deduped)))))
+
+(defun claude-workspaces--load-state ()
+  "Load saved workspace state from `claude-workspaces-state-file'.
+Populates `claude-workspaces--saved' with entries not currently active."
+  (setq claude-workspaces--saved nil)
+  (when (file-exists-p claude-workspaces-state-file)
+    (condition-case err
+        (let* ((json-object-type 'alist)
+               (json-array-type 'list)
+               (data (json-read-file claude-workspaces-state-file))
+               (active-names (mapcar (lambda (ws) (plist-get ws :name))
+                                     claude-workspaces--active)))
+          (dolist (entry data)
+            (let ((name (alist-get 'name entry)))
+              (unless (member name active-names)
+                (push (claude-workspaces--alist-to-workspace entry)
+                      claude-workspaces--saved))))
+          (setq claude-workspaces--saved (nreverse claude-workspaces--saved)))
+      (error (message "claude-workspaces: failed to load state: %s" err)))))
+
+(defun claude-workspaces--remove-saved (name)
+  "Remove workspace NAME from the saved list."
+  (setq claude-workspaces--saved
+        (cl-remove-if (lambda (ws) (string= (plist-get ws :name) name))
+                      claude-workspaces--saved))
+  (claude-workspaces--save-state))
 
 ;;; Default file finder
 
@@ -381,26 +485,38 @@ INITIAL-PROMPT is sent to Claude after startup (optional)."
 ;;;###autoload
 (defun claude-workspaces-kill (&optional name)
   "Kill the agent NAME and close its tab.
+Also works on saved/resumable entries to remove them.
 Prompts for selection if NAME is nil."
   (interactive)
-  (let* ((ws (or (and name (claude-workspaces--find-by-name name))
-                 (claude-workspaces--prompt-for-workspace "Kill agent: "))))
-    (when ws
-      (when (yes-or-no-p (format "Kill agent '%s'? " (plist-get ws :name)))
-        (let ((buf (plist-get ws :claude-buffer))
-              (tab-idx (plist-get ws :tab-index)))
-          ;; Kill the Claude buffer
-          (when (buffer-live-p buf)
-            (claude-code--kill-buffer buf))
-          ;; Close the tab
-          (condition-case nil
-              (tab-bar-close-tab (1+ tab-idx))
-            (error nil))
-          ;; Unregister
-          (claude-workspaces--unregister ws)
-          ;; Recalculate tab indices for remaining workspaces
-          (claude-workspaces--recalculate-tab-indices)
-          (message "Agent '%s' killed" (plist-get ws :name)))))))
+  ;; Check if we're on a saved entry in the dashboard
+  (let ((dashboard-id (and (derived-mode-p 'claude-workspaces-dashboard-mode)
+                           (tabulated-list-get-id))))
+    (if (and dashboard-id (string-prefix-p "saved:" dashboard-id))
+        ;; Kill a saved entry
+        (let ((saved-name (substring dashboard-id 6)))
+          (when (yes-or-no-p (format "Remove saved workspace '%s'? " saved-name))
+            (claude-workspaces--remove-saved saved-name)
+            (revert-buffer)
+            (message "Removed saved workspace '%s'" saved-name)))
+      ;; Kill an active agent
+      (let* ((ws (or (and name (claude-workspaces--find-by-name name))
+                     (claude-workspaces--prompt-for-workspace "Kill agent: "))))
+        (when ws
+          (when (yes-or-no-p (format "Kill agent '%s'? " (plist-get ws :name)))
+            (let ((buf (plist-get ws :claude-buffer))
+                  (tab-idx (plist-get ws :tab-index)))
+              ;; Kill the Claude buffer
+              (when (buffer-live-p buf)
+                (claude-code--kill-buffer buf))
+              ;; Close the tab
+              (condition-case nil
+                  (tab-bar-close-tab (1+ tab-idx))
+                (error nil))
+              ;; Unregister (moves to saved)
+              (claude-workspaces--unregister ws)
+              ;; Recalculate tab indices for remaining workspaces
+              (claude-workspaces--recalculate-tab-indices)
+              (message "Agent '%s' killed" (plist-get ws :name)))))))))
 
 ;;;###autoload
 (defun claude-workspaces-switch (&optional name)
@@ -735,6 +851,26 @@ Active workspaces first, then recent historical sessions."
                      github-ref
                      age))
               entries)))
+    ;; Saved/resumable workspaces
+    (dolist (ws claude-workspaces--saved)
+      (let* ((name (plist-get ws :name))
+             (project (file-name-nondirectory
+                       (directory-file-name (or (plist-get ws :project-dir) ""))))
+             (branch (or (plist-get ws :branch) ""))
+             (github-ref (or (plist-get ws :github-ref) ""))
+             (last-mod (plist-get ws :last-modified))
+             (age (if (and last-mod (> last-mod 0))
+                      (claude-workspaces--relative-time-from-float last-mod)
+                    "")))
+        (push (list (format "saved:%s" name)
+                    (vector
+                     (propertize "⟲ saved" 'face 'font-lock-constant-face)
+                     name
+                     project
+                     branch
+                     github-ref
+                     age))
+              entries)))
     ;; Historical sessions (most recent first, limit to 20)
     (let* ((sessions (claude-workspaces--load-historical-sessions))
            (sorted (sort sessions
@@ -760,9 +896,55 @@ Active workspaces first, then recent historical sessions."
                 entries))))
     (nreverse entries)))
 
+(defun claude-workspaces--resume-saved (name)
+  "Resume a saved workspace by NAME.
+Re-launches Claude in the same directory with --continue."
+  (let ((ws (cl-find-if (lambda (w) (string= (plist-get w :name) name))
+                        claude-workspaces--saved)))
+    (when ws
+      (let* ((dir (or (and (plist-get ws :worktree-p)
+                           (plist-get ws :worktree-path)
+                           (file-directory-p (plist-get ws :worktree-path))
+                           (plist-get ws :worktree-path))
+                      (plist-get ws :project-dir)))
+             (wt-p (plist-get ws :worktree-p))
+             (wt-path (plist-get ws :worktree-path)))
+        (unless (file-directory-p dir)
+          (user-error "Directory no longer exists: %s" dir))
+        ;; Ensure dashboard tab exists
+        (claude-workspaces--ensure-dashboard-tab)
+        ;; Create agent tab
+        (let ((tab-idx (claude-workspaces--create-tab name)))
+          ;; Start Claude with --continue
+          (let ((claude-buf (claude-workspaces--start-claude-in-dir
+                             dir name nil '("--continue"))))
+            (if claude-buf
+                (progn
+                  (claude-workspaces--setup-layout dir claude-buf)
+                  (let ((new-ws (list :name name
+                                      :tab-index tab-idx
+                                      :claude-buffer claude-buf
+                                      :project-dir (plist-get ws :project-dir)
+                                      :session-id nil
+                                      :status :running
+                                      :branch (or (claude-workspaces--current-branch dir)
+                                                  (plist-get ws :branch))
+                                      :worktree-p wt-p
+                                      :worktree-path wt-path
+                                      :github-ref (plist-get ws :github-ref)
+                                      :last-modified (float-time))))
+                    (claude-workspaces--register new-ws)
+                    (claude-workspaces--ensure-status-timer)
+                    (message "Resumed agent '%s' in %s" name dir)
+                    new-ws))
+              (tab-bar-close-tab)
+              (message "Failed to resume Claude in %s" dir)
+              nil)))))))
+
 (defun claude-workspaces--dashboard-action ()
   "Action for RET in the dashboard.
 For active agents: switch to their tab.
+For saved workspaces: resume with --continue.
 For historical sessions: offer to resume."
   (interactive)
   (let ((id (tabulated-list-get-id)))
@@ -773,6 +955,9 @@ For historical sessions: offer to resume."
                (ws (claude-workspaces--find-by-name name)))
           (when ws
             (tab-bar-select-tab (1+ (plist-get ws :tab-index))))))
+       ((string-prefix-p "saved:" id)
+        (let ((name (substring id 6)))
+          (claude-workspaces--resume-saved name)))
        ((string-prefix-p "session:" id)
         (let ((sid (substring id 8)))
           (message "Resume session %s? Use claude-workspaces-resume for full functionality." sid)))))))
@@ -849,9 +1034,13 @@ Enables tab-bar-mode and sets up the dashboard tab."
   (if claude-workspaces-mode
       (progn
         (tab-bar-mode 1)
+        (claude-workspaces--load-state)
         (claude-workspaces--ensure-status-timer)
+        (add-hook 'kill-emacs-hook #'claude-workspaces--save-state)
         (message "Claude Workspaces mode enabled"))
+    (claude-workspaces--save-state)
     (claude-workspaces--stop-status-timer)
+    (remove-hook 'kill-emacs-hook #'claude-workspaces--save-state)
     (message "Claude Workspaces mode disabled")))
 
 (provide 'claude-workspaces)

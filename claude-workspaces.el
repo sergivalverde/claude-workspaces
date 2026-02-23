@@ -234,16 +234,17 @@ CLAUDE-BUFFER is the terminal buffer running Claude."
 INITIAL-PROMPT is sent after Claude starts (if non-nil).
 EXTRA-SWITCHES are additional CLI flags.
 Returns the Claude buffer."
-  (let ((default-directory dir))
+  (let* ((default-directory dir)
+         ;; Snapshot existing claude buffers so we can find the new one
+         (before (claude-code--find-all-claude-buffers)))
     ;; Use claude-code's own start machinery
     ;; We suppress its display function since we handle layout ourselves
     (let ((claude-code-display-window-fn #'ignore))
       (claude-code--start nil extra-switches nil nil))
-    ;; Find the buffer that was just created
+    ;; Find the newly created buffer (the one not in 'before')
     (let ((buf (cl-find-if
                 (lambda (b) (and (claude-code--buffer-p b)
-                                 (string-match-p (regexp-quote (abbreviate-file-name (file-truename dir)))
-                                                 (buffer-name b))))
+                                 (not (memq b before))))
                 (buffer-list))))
       (when (and buf initial-prompt)
         (run-at-time 1.0 nil

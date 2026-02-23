@@ -92,6 +92,17 @@ Each element is a string like \"owner/repo\"."
   :type 'file
   :group 'claude-workspaces)
 
+(defcustom claude-workspaces-remote-host nil
+  "SSH host for remote agents (e.g. \"mic2\").
+When non-nil, remote launch commands are available."
+  :type '(choice (const :tag "None" nil) string)
+  :group 'claude-workspaces)
+
+(defcustom claude-workspaces-remote-claude-program "claude"
+  "Path to claude binary on the remote host."
+  :type 'string
+  :group 'claude-workspaces)
+
 ;;; Internal state
 
 (defvar claude-workspaces--active nil
@@ -169,7 +180,10 @@ Each plist has keys:
                         :github-ref (plist-get workspace :github-ref)
                         :status :saved
                         :last-modified (or (plist-get workspace :last-modified)
-                                           (float-time)))))
+                                           (float-time))
+                        :remote-p (plist-get workspace :remote-p)
+                        :remote-host (plist-get workspace :remote-host)
+                        :tmux-session (plist-get workspace :tmux-session))))
     (push saved-ws claude-workspaces--saved))
   (claude-workspaces--save-state))
 
@@ -187,7 +201,8 @@ Each plist has keys:
 (defun claude-workspaces--workspace-to-alist (ws)
   "Convert workspace plist WS to an alist suitable for JSON serialization."
   (let ((fields '(:name :project-dir :branch :worktree-p :worktree-path
-                        :github-ref :status :last-modified)))
+                        :github-ref :status :last-modified
+                        :remote-p :remote-host :tmux-session)))
     (cl-loop for key in fields
              for val = (plist-get ws key)
              when val
@@ -203,7 +218,10 @@ Each plist has keys:
         :worktree-path (alist-get 'worktree-path alist)
         :github-ref (alist-get 'github-ref alist)
         :status :saved
-        :last-modified (or (alist-get 'last-modified alist) 0.0)))
+        :last-modified (or (alist-get 'last-modified alist) 0.0)
+        :remote-p (eq (alist-get 'remote-p alist) t)
+        :remote-host (alist-get 'remote-host alist)
+        :tmux-session (alist-get 'tmux-session alist)))
 
 (defun claude-workspaces--save-state ()
   "Persist active and saved workspaces to `claude-workspaces-state-file'."
@@ -360,6 +378,131 @@ Returns the Claude buffer."
                            (claude-code--term-send-string claude-code-terminal-backend "\r"))))))
       buf)))
 
+;;; Remote agent launch
+
+(defun claude-workspaces--remote-list-dirs ()
+  "List project directories on the remote host for completion."
+  (when claude-workspaces-remote-host
+    (let ((output (string-trim
+                   (shell-command-to-string
+                    (format "ssh %s 'for d in ~/projects/*/; do [ -d \"$d\" ] && echo \"$d\"; done' 2>/dev/null"
+                            (shell-quote-argument claude-workspaces-remote-host))))))
+      (unless (string-empty-p output)
+        (split-string output "\n" t)))))
+
+(defun claude-workspaces--start-remote-claude (dir name &optional extra-switches)
+  "Start Claude on the remote host in DIR with NAME.
+DIR is a path on the remote host.
+EXTRA-SWITCHES are additional CLI flags for claude.
+Returns the terminal buffer."
+  (unless claude-workspaces-remote-host
+    (user-error "claude-workspaces-remote-host is not set"))
+  (let* ((switches-str (if extra-switches
+                           (concat " " (mapconcat #'shell-quote-argument
+                                                  extra-switches " "))
+                         ""))
+         (remote-cmd (format "cd %s && %s%s"
+                             (shell-quote-argument dir)
+                             claude-workspaces-remote-claude-program
+                             switches-str))
+         (tmux-session (format "cw-%s" name))
+         ;; Create or attach: if tmux session exists, attach; otherwise create
+         (ssh-cmd (format "tmux new-session -d -s %s %s 2>/dev/null; exec tmux attach -t %s"
+                          (shell-quote-argument tmux-session)
+                          (shell-quote-argument remote-cmd)
+                          (shell-quote-argument tmux-session)))
+         (buf-name (format "*claude-remote:%s*" name)))
+    (claude-code--term-make
+     claude-code-terminal-backend
+     buf-name
+     "ssh"
+     (list "-t" claude-workspaces-remote-host ssh-cmd))))
+
+(defun claude-workspaces--reconnect-remote (name)
+  "Reconnect to a tmux session NAME on the remote host.
+Returns the terminal buffer."
+  (let* ((tmux-session (format "cw-%s" name))
+         (buf-name (format "*claude-remote:%s*" name)))
+    ;; Kill old buffer if it exists
+    (when-let ((old-buf (get-buffer buf-name)))
+      (kill-buffer old-buf))
+    (claude-code--term-make
+     claude-code-terminal-backend
+     buf-name
+     "ssh"
+     (list "-t" claude-workspaces-remote-host
+           (format "tmux attach -t %s" (shell-quote-argument tmux-session))))))
+
+(defun claude-workspaces--remote-tmux-alive-p (name)
+  "Check if tmux session for workspace NAME exists on the remote host."
+  (when claude-workspaces-remote-host
+    (let ((tmux-session (format "cw-%s" name)))
+      (zerop (call-process "ssh" nil nil nil
+                           claude-workspaces-remote-host
+                           (format "tmux has-session -t %s 2>/dev/null"
+                                   (shell-quote-argument tmux-session)))))))
+
+;;;###autoload
+(defun claude-workspaces-launch-remote (&optional dir name initial-prompt)
+  "Launch a Claude agent on the remote host in its own tab.
+DIR is a project directory on the remote host (prompted if nil).
+NAME is the workspace name (prompted if nil).
+INITIAL-PROMPT is sent to Claude after startup (optional)."
+  (interactive)
+  (unless claude-workspaces-remote-host
+    (user-error "Set claude-workspaces-remote-host first (e.g. \"mic2\")"))
+  (let* ((remote-dirs (claude-workspaces--remote-list-dirs))
+         (dir (or dir
+                  (if remote-dirs
+                      (completing-read
+                       (format "Remote directory on %s: " claude-workspaces-remote-host)
+                       remote-dirs nil nil)
+                    (read-string
+                     (format "Remote directory on %s: " claude-workspaces-remote-host)
+                     "~/projects/"))))
+         (default-name (file-name-nondirectory (directory-file-name dir)))
+         (name (or name (read-string (format "Agent name (default: %s): " default-name)
+                                     nil nil default-name)))
+         (name (claude-workspaces--unique-name name))
+         (extra-switches (when initial-prompt
+                           ;; Can't send keystrokes to tmux easily,
+                           ;; so use --prompt for initial prompt
+                           (list "-p" initial-prompt))))
+    ;; Ensure dashboard tab exists
+    (claude-workspaces--ensure-dashboard-tab)
+    ;; Create agent tab
+    (let ((tab-idx (claude-workspaces--create-tab
+                    (format "%s @%s" name claude-workspaces-remote-host))))
+      (let ((claude-buf (claude-workspaces--start-remote-claude dir name extra-switches)))
+        (if claude-buf
+            (progn
+              ;; Layout: claude-only for remote (no local files to show)
+              (delete-other-windows)
+              (switch-to-buffer claude-buf)
+              ;; Register workspace
+              (let ((ws (list :name name
+                              :tab-index tab-idx
+                              :claude-buffer claude-buf
+                              :project-dir dir
+                              :session-id nil
+                              :status :running
+                              :branch nil
+                              :worktree-p nil
+                              :worktree-path nil
+                              :github-ref nil
+                              :remote-p t
+                              :remote-host claude-workspaces-remote-host
+                              :tmux-session (format "cw-%s" name)
+                              :last-modified (float-time))))
+                (claude-workspaces--register ws)
+                (claude-workspaces--ensure-status-timer)
+                (message "Remote agent '%s' launched on %s:%s"
+                         name claude-workspaces-remote-host dir)
+                ws))
+          (tab-bar-close-tab)
+          (message "Failed to start remote Claude on %s" claude-workspaces-remote-host)
+          nil)))))
+
 ;;;###autoload
 (defun claude-workspaces-launch (&optional dir name initial-prompt)
   "Launch a new Claude agent in its own tab.
@@ -412,9 +555,16 @@ INITIAL-PROMPT is sent to Claude after startup (optional)."
   (let* ((buf (plist-get workspace :claude-buffer))
          (proc (and (buffer-live-p buf) (get-buffer-process buf))))
     (cond
-     ((not proc) :done)
+     ((not proc)
+      ;; No process — for remote agents, tmux may still be alive
+      (if (and (plist-get workspace :remote-p)
+               (plist-get workspace :tmux-session))
+          :disconnected
+        :done))
      ((not (process-live-p proc))
-      (if (zerop (process-exit-status proc)) :done :error))
+      (if (plist-get workspace :remote-p)
+          :disconnected
+        (if (zerop (process-exit-status proc)) :done :error)))
      (t
       ;; Check buffer modification time
       (let* ((last (plist-get workspace :last-modified))
@@ -433,10 +583,11 @@ INITIAL-PROMPT is sent to Claude after startup (optional)."
 (defun claude-workspaces--status-indicator (status)
   "Return a display string for STATUS keyword."
   (pcase status
-    (:running (propertize "▶" 'face 'success))
-    (:waiting (propertize "⏸" 'face 'warning))
-    (:done    (propertize "✓" 'face 'shadow))
-    (:error   (propertize "✗" 'face 'error))
+    (:running      (propertize "▶" 'face 'success))
+    (:waiting      (propertize "⏸" 'face 'warning))
+    (:done         (propertize "✓" 'face 'shadow))
+    (:error        (propertize "✗" 'face 'error))
+    (:disconnected (propertize "⚡" 'face 'warning))
     (_ "?")))
 
 (defun claude-workspaces--update-all-statuses ()
@@ -832,6 +983,9 @@ Active workspaces first, then recent historical sessions."
     (dolist (ws claude-workspaces--active)
       (let* ((name (plist-get ws :name))
              (status (plist-get ws :status))
+             (host (if (plist-get ws :remote-p)
+                       (plist-get ws :remote-host)
+                     "local"))
              (project (file-name-nondirectory
                        (directory-file-name (plist-get ws :project-dir))))
              (branch (or (plist-get ws :branch) ""))
@@ -844,7 +998,7 @@ Active workspaces first, then recent historical sessions."
                     (vector
                      (format "%s %s"
                              (claude-workspaces--status-indicator status)
-                             (symbol-name status))
+                             host)
                      name
                      project
                      branch
@@ -864,7 +1018,11 @@ Active workspaces first, then recent historical sessions."
                     "")))
         (push (list (format "saved:%s" name)
                     (vector
-                     (propertize "⟲ saved" 'face 'font-lock-constant-face)
+                     (propertize (format "⟲ %s"
+                                        (if (plist-get ws :remote-p)
+                                            (plist-get ws :remote-host)
+                                          "local"))
+                                'face 'font-lock-constant-face)
                      name
                      project
                      branch
@@ -898,48 +1056,126 @@ Active workspaces first, then recent historical sessions."
 
 (defun claude-workspaces--resume-saved (name)
   "Resume a saved workspace by NAME.
-Re-launches Claude in the same directory with --continue."
+For remote workspaces, reattaches to tmux session on the remote host.
+For local workspaces, re-launches Claude with --continue."
   (let ((ws (cl-find-if (lambda (w) (string= (plist-get w :name) name))
                         claude-workspaces--saved)))
     (when ws
-      (let* ((dir (or (and (plist-get ws :worktree-p)
-                           (plist-get ws :worktree-path)
-                           (file-directory-p (plist-get ws :worktree-path))
-                           (plist-get ws :worktree-path))
-                      (plist-get ws :project-dir)))
-             (wt-p (plist-get ws :worktree-p))
-             (wt-path (plist-get ws :worktree-path)))
-        (unless (file-directory-p dir)
-          (user-error "Directory no longer exists: %s" dir))
-        ;; Ensure dashboard tab exists
-        (claude-workspaces--ensure-dashboard-tab)
-        ;; Create agent tab
-        (let ((tab-idx (claude-workspaces--create-tab name)))
-          ;; Start Claude with --continue
-          (let ((claude-buf (claude-workspaces--start-claude-in-dir
-                             dir name nil '("--continue"))))
-            (if claude-buf
-                (progn
-                  (claude-workspaces--setup-layout dir claude-buf)
-                  (let ((new-ws (list :name name
-                                      :tab-index tab-idx
-                                      :claude-buffer claude-buf
-                                      :project-dir (plist-get ws :project-dir)
-                                      :session-id nil
-                                      :status :running
-                                      :branch (or (claude-workspaces--current-branch dir)
-                                                  (plist-get ws :branch))
-                                      :worktree-p wt-p
-                                      :worktree-path wt-path
-                                      :github-ref (plist-get ws :github-ref)
-                                      :last-modified (float-time))))
-                    (claude-workspaces--register new-ws)
-                    (claude-workspaces--ensure-status-timer)
-                    (message "Resumed agent '%s' in %s" name dir)
-                    new-ws))
-              (tab-bar-close-tab)
-              (message "Failed to resume Claude in %s" dir)
-              nil)))))))
+      (if (plist-get ws :remote-p)
+          ;; Remote resume: reattach to tmux or start fresh with --continue
+          (claude-workspaces--resume-remote ws)
+        ;; Local resume
+        (claude-workspaces--resume-local ws)))))
+
+(defun claude-workspaces--resume-local (ws)
+  "Resume a local saved workspace WS with --continue."
+  (let* ((name (plist-get ws :name))
+         (dir (or (and (plist-get ws :worktree-p)
+                       (plist-get ws :worktree-path)
+                       (file-directory-p (plist-get ws :worktree-path))
+                       (plist-get ws :worktree-path))
+                  (plist-get ws :project-dir)))
+         (wt-p (plist-get ws :worktree-p))
+         (wt-path (plist-get ws :worktree-path)))
+    (unless (file-directory-p dir)
+      (user-error "Directory no longer exists: %s" dir))
+    (claude-workspaces--ensure-dashboard-tab)
+    (let ((tab-idx (claude-workspaces--create-tab name)))
+      (let ((claude-buf (claude-workspaces--start-claude-in-dir
+                         dir name nil '("--continue"))))
+        (if claude-buf
+            (progn
+              (claude-workspaces--setup-layout dir claude-buf)
+              (let ((new-ws (list :name name
+                                  :tab-index tab-idx
+                                  :claude-buffer claude-buf
+                                  :project-dir (plist-get ws :project-dir)
+                                  :session-id nil
+                                  :status :running
+                                  :branch (or (claude-workspaces--current-branch dir)
+                                              (plist-get ws :branch))
+                                  :worktree-p wt-p
+                                  :worktree-path wt-path
+                                  :github-ref (plist-get ws :github-ref)
+                                  :last-modified (float-time))))
+                (claude-workspaces--register new-ws)
+                (claude-workspaces--ensure-status-timer)
+                (message "Resumed agent '%s' in %s" name dir)
+                new-ws))
+          (tab-bar-close-tab)
+          (message "Failed to resume Claude in %s" dir)
+          nil)))))
+
+(defun claude-workspaces--resume-remote (ws)
+  "Resume a remote saved workspace WS by reattaching to tmux or starting fresh."
+  (let* ((name (plist-get ws :name))
+         (host (plist-get ws :remote-host))
+         (dir (plist-get ws :project-dir))
+         (tmux-alive (claude-workspaces--remote-tmux-alive-p name)))
+    (claude-workspaces--ensure-dashboard-tab)
+    (let ((tab-idx (claude-workspaces--create-tab
+                    (format "%s @%s" name host))))
+      (let ((claude-buf (if tmux-alive
+                            ;; Reattach to existing tmux session
+                            (claude-workspaces--reconnect-remote name)
+                          ;; Start fresh with --continue
+                          (let ((claude-workspaces-remote-host host))
+                            (claude-workspaces--start-remote-claude
+                             dir name '("--continue"))))))
+        (if claude-buf
+            (progn
+              (delete-other-windows)
+              (switch-to-buffer claude-buf)
+              (let ((new-ws (list :name name
+                                  :tab-index tab-idx
+                                  :claude-buffer claude-buf
+                                  :project-dir dir
+                                  :session-id nil
+                                  :status :running
+                                  :branch (plist-get ws :branch)
+                                  :worktree-p nil
+                                  :worktree-path nil
+                                  :github-ref (plist-get ws :github-ref)
+                                  :remote-p t
+                                  :remote-host host
+                                  :tmux-session (format "cw-%s" name)
+                                  :last-modified (float-time))))
+                (claude-workspaces--register new-ws)
+                (claude-workspaces--ensure-status-timer)
+                (message "Resumed remote agent '%s' on %s%s"
+                         name host
+                         (if tmux-alive " (reattached)" " (new session)"))
+                new-ws))
+          (tab-bar-close-tab)
+          (message "Failed to resume remote agent on %s" host)
+          nil)))))
+
+(defun claude-workspaces--reconnect-active (ws)
+  "Reconnect a disconnected remote workspace WS by reattaching to tmux."
+  (let* ((name (plist-get ws :name))
+         (tab-idx (plist-get ws :tab-index))
+         (claude-buf (claude-workspaces--reconnect-remote name)))
+    (when claude-buf
+      (plist-put ws :claude-buffer claude-buf)
+      (plist-put ws :status :running)
+      (plist-put ws :last-modified (float-time))
+      ;; Switch to the tab and update its buffer
+      (tab-bar-select-tab (1+ tab-idx))
+      (delete-other-windows)
+      (switch-to-buffer claude-buf)
+      (message "Reconnected to '%s' on %s" name (plist-get ws :remote-host)))))
+
+;;;###autoload
+(defun claude-workspaces-reconnect-remote ()
+  "Reconnect to a disconnected remote agent from the dashboard."
+  (interactive)
+  (let ((id (and (derived-mode-p 'claude-workspaces-dashboard-mode)
+                 (tabulated-list-get-id))))
+    (when (and id (string-prefix-p "active:" id))
+      (let* ((name (substring id 7))
+             (ws (claude-workspaces--find-by-name name)))
+        (when (and ws (plist-get ws :remote-p))
+          (claude-workspaces--reconnect-active ws))))))
 
 (defun claude-workspaces--dashboard-action ()
   "Action for RET in the dashboard.
@@ -954,7 +1190,11 @@ For historical sessions: offer to resume."
         (let* ((name (substring id 7))
                (ws (claude-workspaces--find-by-name name)))
           (when ws
-            (tab-bar-select-tab (1+ (plist-get ws :tab-index))))))
+            (if (and (eq (plist-get ws :status) :disconnected)
+                     (plist-get ws :remote-p))
+                ;; Reconnect disconnected remote agent
+                (claude-workspaces--reconnect-active ws)
+              (tab-bar-select-tab (1+ (plist-get ws :tab-index)))))))
        ((string-prefix-p "saved:" id)
         (let ((name (substring id 6)))
           (claude-workspaces--resume-saved name)))
@@ -966,11 +1206,13 @@ For historical sessions: offer to resume."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") #'claude-workspaces--dashboard-action)
     (define-key map (kbd "n")   #'claude-workspaces-launch)
+    (define-key map (kbd "N")   #'claude-workspaces-launch-remote)
     (define-key map (kbd "w")   #'claude-workspaces-launch-worktree)
     (define-key map (kbd "i")   #'claude-workspaces-from-issue)
     (define-key map (kbd "p")   #'claude-workspaces-from-pr)
     (define-key map (kbd "k")   #'claude-workspaces-kill)
     (define-key map (kbd "P")   #'claude-workspaces-create-pr)
+    (define-key map (kbd "r")   #'claude-workspaces-reconnect-remote)
     (define-key map (kbd "g")   #'claude-workspaces-dashboard-refresh)
     (define-key map (kbd "s")   #'claude-workspaces-switch)
     (define-key map (kbd "?")   #'claude-workspaces-dashboard-help)
@@ -982,7 +1224,7 @@ For historical sessions: offer to resume."
 
 \\{claude-workspaces-dashboard-mode-map}"
   (setq tabulated-list-format
-        [("Status" 12 t)
+        [("Status" 14 t)
          ("Name" 20 t)
          ("Project" 15 t)
          ("Branch" 25 t)
@@ -1006,7 +1248,7 @@ For historical sessions: offer to resume."
 (defun claude-workspaces-dashboard-help ()
   "Show dashboard key bindings."
   (interactive)
-  (message "n:new  w:worktree  i:issue  p:PR  k:kill  P:create-PR  s:switch  g:refresh  RET:go"))
+  (message "n:new  N:remote  w:worktree  i:issue  p:PR  k:kill  r:reconnect  P:create-PR  s:switch  g:refresh  RET:go"))
 
 ;;;###autoload
 (defun claude-workspaces-dashboard ()
